@@ -458,7 +458,9 @@ local S = {
     flyOn=false, flyVal=60, hjOn=false, hjVal=100,
     ijOn=false, noclipOn=false, glideOn=false, lowGravOn=false,
     swimOn=false, swimVal=30,
-    aimbotOn=false, aimbotSmooth=0.3, aimbotFOV=200, aimbotBone="Head",
+    aimbotOn=false, aimbotSmooth=3, aimbotFOV=200, aimbotBone="Head",
+    aimbotWallcheck=false, aimbotTeamcheck=false, aimbotPrediction=false,
+    triggerbotOn=false, triggerbotFOV=18, triggerbotDelay=0.05,
     hitboxOn=false, hitboxSize=6,
     antiKBOn=false, reachOn=false, reachVal=8, fastHitOn=false, godModeOn=false,
     fullbrightOn=false, antiAFKOn=true, timeVal=14,
@@ -532,12 +534,28 @@ Slider(PMovement,"Swim Speed Val",10,200,30,function(v) S.swimVal=v end)
 -- COMBAT PAGE
 -- ================================================
 Section(PCombat,"Aimbot")
-Toggle(PCombat,"Aimbot","Auto-aim camera to nearest player",false,function(v)
+Toggle(PCombat,"Aimbot","Auto-aim zur nächsten Person im FOV",false,function(v)
     S.aimbotOn=v; Notify("Aimbot",v and "Aktiviert" or "Deaktiviert",v and "success" or "warn")
 end)
 Dropdown(PCombat,"Aimbot Target",{"Head","HumanoidRootPart","Torso","Left Leg","Right Leg"},"Head",function(v) S.aimbotBone=v end)
-Slider(PCombat,"Aimbot Smooth (1=fast)",1,10,3,function(v) S.aimbotSmooth=v/10 end)
-Slider(PCombat,"Aimbot FOV",20,500,200,function(v) S.aimbotFOV=v end)
+Slider(PCombat,"Smoothness (1=instant 10=slow)",1,10,3,function(v) S.aimbotSmooth=v end)
+Slider(PCombat,"Aimbot FOV (px)",20,500,200,function(v) S.aimbotFOV=v end)
+Toggle(PCombat,"Wallcheck","Nur sichtbare Gegner anzielen",false,function(v)
+    S.aimbotWallcheck=v; Notify("Wallcheck",v and "An – nur sichtbare" or "Aus",v and "success" or "warn")
+end)
+Toggle(PCombat,"Team Check","Eigene Teammates ignorieren",false,function(v)
+    S.aimbotTeamcheck=v; Notify("Teamcheck",v and "Aktiv" or "Inaktiv",v and "success" or "warn")
+end)
+Toggle(PCombat,"Prediction","Bewegungsvorhersage beim Zielen",false,function(v)
+    S.aimbotPrediction=v
+end)
+
+Section(PCombat,"Triggerbot")
+Toggle(PCombat,"Triggerbot","Schießt wenn Visier auf Gegner zeigt",false,function(v)
+    S.triggerbotOn=v; Notify("Triggerbot",v and "Aktiv – Vorsicht!" or "Aus",v and "warn" or "info")
+end)
+Slider(PCombat,"Trigger FOV (px)",2,60,18,function(v) S.triggerbotFOV=v end)
+Slider(PCombat,"Trigger Delay (ms)",0,20,5,function(v) S.triggerbotDelay=v/100 end)
 
 Section(PCombat,"Hitbox")
 Toggle(PCombat,"Bigger Hitboxes","Expand enemy hit collision boxes",false,function(v)
@@ -851,25 +869,100 @@ RunService.RenderStepped:Connect(function(dt)
     if S.chamsOn then for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer and p.Character then for _,part in ipairs(p.Character:GetDescendants()) do if part:IsA("BasePart") then pcall(function() part.Color=S.chamsColor; part.Material=Enum.Material.Neon end) end end end end end
     -- Hitbox Expander
     if S.hitboxOn then for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer and p.Character then local hrp=p.Character:FindFirstChild("HumanoidRootPart"); if hrp then pcall(function() hrp.Size=Vector3.new(S.hitboxSize,S.hitboxSize,S.hitboxSize) end) end end end end
-    -- Aimbot (camera-based)
+    -- == Aimbot Helpers ==
+    local function IsVisible(targetPos)
+        local origin = Camera.CFrame.Position
+        local direction = (targetPos - origin)
+        local rayParams = RaycastParams.new()
+        rayParams.FilterDescendantsInstances = {}
+        -- build ignore list: all player characters
+        local ignoreList = {}
+        for _,pl in ipairs(Players:GetPlayers()) do
+            if pl.Character then table.insert(ignoreList, pl.Character) end
+        end
+        rayParams.FilterDescendantsInstances = ignoreList
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        local result = Workspace:Raycast(origin, direction, rayParams)
+        return result == nil
+    end
+
+    local function IsSameTeam(player)
+        if not S.aimbotTeamcheck then return false end
+        return LocalPlayer.Team ~= nil and LocalPlayer.Team == player.Team
+    end
+
+    -- Aimbot (camera-based, with wallcheck / teamcheck / prediction / smooth)
+    local aimbotTarget = nil
     if S.aimbotOn then
-        local nearestTarget=nil; local nearestDist=S.aimbotFOV
-        local center=Vector2.new(Camera.ViewportSize.X/2,Camera.ViewportSize.Y/2)
+        local nearestDist = S.aimbotFOV
+        local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
         for _,p in ipairs(Players:GetPlayers()) do
-            if p~=LocalPlayer and p.Character then
-                local bone=p.Character:FindFirstChild(S.aimbotBone) or p.Character.PrimaryPart
+            if p ~= LocalPlayer and p.Character then
+                if IsSameTeam(p) then continue end
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if not hum or hum.Health <= 0 then continue end
+                local bone = p.Character:FindFirstChild(S.aimbotBone) or p.Character.PrimaryPart
                 if bone then
-                    local sp,onScreen=Camera:WorldToViewportPoint(bone.Position)
-                    if onScreen and sp.Z>0 then
-                        local d=(Vector2.new(sp.X,sp.Y)-center).Magnitude
-                        if d<nearestDist then nearestDist=d; nearestTarget=bone end
+                    local targetPos = bone.Position
+                    if S.aimbotPrediction and p.Character.PrimaryPart then
+                        local vel = p.Character.PrimaryPart.Velocity
+                        local dist = (Camera.CFrame.Position - targetPos).Magnitude
+                        local travelTime = dist / 400
+                        targetPos = targetPos + vel * travelTime
+                    end
+                    local sp, onScreen = Camera:WorldToViewportPoint(targetPos)
+                    if onScreen and sp.Z > 0 then
+                        local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                        if d < nearestDist then
+                            if S.aimbotWallcheck and not IsVisible(targetPos) then continue end
+                            nearestDist = d
+                            aimbotTarget = {bone = bone, pos = targetPos}
+                        end
                     end
                 end
             end
         end
-        if nearestTarget then
-            local targetCF=CFrame.new(Camera.CFrame.Position,nearestTarget.Position)
-            Camera.CFrame=Camera.CFrame:Lerp(targetCF,math.clamp(S.aimbotSmooth,0.05,1))
+        if aimbotTarget then
+            local lerpAlpha = math.clamp((11 - S.aimbotSmooth) * 0.1, 0.05, 1)
+            local targetCF = CFrame.new(Camera.CFrame.Position, aimbotTarget.pos)
+            Camera.CFrame = Camera.CFrame:Lerp(targetCF, lerpAlpha)
+        end
+    end
+
+    -- Triggerbot
+    if S.triggerbotOn then
+        local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                if IsSameTeam(p) then continue end
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if not hum or hum.Health <= 0 then continue end
+                for _, bone in ipairs(p.Character:GetDescendants()) do
+                    if bone:IsA("BasePart") then
+                        local sp, onScreen = Camera:WorldToViewportPoint(bone.Position)
+                        if onScreen and sp.Z > 0 then
+                            local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                            if d <= S.triggerbotFOV then
+                                if S.aimbotWallcheck and not IsVisible(bone.Position) then break end
+                                task.delay(S.triggerbotDelay, function()
+                                    -- fire a virtual mouse click (executor-dependent)
+                                    pcall(function()
+                                        mouse1press(); task.wait(0.06); mouse1release()
+                                    end)
+                                    pcall(function()
+                                        game:GetService("VirtualInputManager"):SendMouseButtonEvent(
+                                            center.X, center.Y, 0, true, game, 1)
+                                        task.wait(0.06)
+                                        game:GetService("VirtualInputManager"):SendMouseButtonEvent(
+                                            center.X, center.Y, 0, false, game, 1)
+                                    end)
+                                end)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
     -- Crosshair
